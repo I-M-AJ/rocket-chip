@@ -1,0 +1,135 @@
+================================================================================
+Rocket Chip SoC — WSL2 Setup, Build & Simulation Guide (How_to.txt)
+================================================================================
+
+IMPORTANT: Always run Git submodules, Nix, Mill, and Verilator commands from
+inside WSL2 (Ubuntu), NOT from Windows PowerShell/CMD.
+- Windows Git can write Windows drive paths (e.g., F:/...) into submodule .git
+  files and convert scripts to CRLF (\r\n), breaking builds inside WSL.
+- Working on /mnt/f/... (Windows NTFS mounted via 9p) does not support Linux
+  AF_UNIX sockets, so Mill must always be invoked with `-i` (`mill -i`), which
+  is already configured as the default in `Makefile` (`MILL ?= mill -i`).
+- Optional speedup: Cloning/working inside WSL's native Linux filesystem
+  (e.g., `~/rocket-chip`) builds ~5-10x faster than `/mnt/f/...`.
+
+--------------------------------------------------------------------------------
+1. One-Time Prerequisites (Windows + WSL2 Ubuntu)
+--------------------------------------------------------------------------------
+1. Ensure WSL2 with Ubuntu (e.g., Ubuntu-24.04) is installed on Windows:
+     wsl --install -d Ubuntu-24.04
+
+2. Open your WSL Ubuntu terminal:
+     wsl -d Ubuntu-24.04
+
+3. Configure Git inside WSL to preserve Unix LF line endings:
+     git config --global core.autocrlf input
+
+4. Install Nix (multi-user daemon) inside WSL Ubuntu:
+     sh <(curl -L https://nixos.org/nix/install) --daemon
+
+5. Enable Nix Flakes permanently (so `nix develop` works without extra flags):
+     mkdir -p ~/.config/nix
+     echo "experimental-features = nix-command flakes" >> ~/.config/nix/nix.conf
+
+6. Restart your WSL shell (or run `sudo shutdown now` and reopen WSL) so the
+   `nix` command and daemon are active.
+
+--------------------------------------------------------------------------------
+2. Cloning & Initializing Submodules (Inside WSL)
+--------------------------------------------------------------------------------
+Clone the repository and initialize ONLY the 4 top-level submodules defined in
+`.gitmodules` (`cde`, `chisel`, `diplomacy`, `hardfloat`):
+
+     git clone https://github.com/I-M-AJ/rocket-chip.git
+     cd rocket-chip
+     git submodule update --init --jobs 4
+
+(Note: `--recursive` is NOT needed and avoids downloading large nested repos.)
+
+--------------------------------------------------------------------------------
+3. Entering the Build & Simulation Environment (Every New WSL Terminal)
+--------------------------------------------------------------------------------
+Rocket Chip uses `flake.nix` to provide pinned versions of all required tools
+(`mill 0.11.1`, CIRCT `firtool`, `verilator`, `clang/clang++`, `cmake`, `ninja`,
+`dtc`, `spike`/`libfesvr`, `riscv64-none-elf-gcc`, `gdb`, `openocd`,
+`riscv-tests`, and Python `riscof`).
+
+Whenever you open a new WSL terminal:
+
+     cd /mnt/f/Anamoly_detection/rocket-chip   # or ~/rocket-chip
+     nix develop
+
+(First-time run downloads/builds `/nix/store` packages and installs `riscof`
+into `./venv` — takes several minutes once, then ~1-2 seconds on future runs.)
+
+Verify tools inside the shell:
+     which mill firtool verilator spike riscv64-none-elf-gcc
+
+--------------------------------------------------------------------------------
+4. Generating SystemVerilog RTL
+--------------------------------------------------------------------------------
+Inside `nix develop`:
+
+  # Default RV64GC BigCore SoC (DefaultConfig):
+  make verilog
+
+  # Smaller physical-addressing core (DefaultSmallConfig):
+  make verilog CONFIG=freechips.rocketchip.system.DefaultSmallConfig
+
+  # Dual-core coherent RV64GC SoC:
+  make verilog CONFIG=freechips.rocketchip.system.DualCoreConfig
+
+Generated outputs are written under `out/emulator/freechips.rocketchip.system.TestHarness/<CONFIG>/`:
+  - SystemVerilog (.sv/.v + filelist.f): `mfccompiler/compile.dest/`
+  - FIRRTL (.fir), Device Tree (.dts), & Address Map (`memmap.json`):
+    `generator/elaborate.dest/`
+
+--------------------------------------------------------------------------------
+5. Compiling the Cycle-Accurate Verilator Simulator (`emulator`)
+--------------------------------------------------------------------------------
+Inside `nix develop`:
+
+  # Via Makefile helper target:
+  make emulator CONFIG=freechips.rocketchip.system.DefaultConfig
+
+  # Or directly via Mill (always include `-i` when on /mnt/f):
+  mill -i "emulator[freechips.rocketchip.system.TestHarness,freechips.rocketchip.system.DefaultConfig].elf"
+
+The compiled simulator executable is located at:
+  out/emulator/freechips.rocketchip.system.TestHarness/<CONFIG>/verilator/elf.dest/emulator
+
+--------------------------------------------------------------------------------
+6. Running Simulations & RISC-V Tests
+--------------------------------------------------------------------------------
+A) Run built-in `riscv-tests` suites via Mill:
+
+  # Run RV64 user-level integer suite (`rv64ui-p`, excluding `ma_data`) on DefaultConfig:
+  mill -i "runnable-riscv-test[freechips.rocketchip.system.TestHarness,freechips.rocketchip.system.DefaultConfig,rv64ui-p,ma_data].run"
+
+  # Run ALL configured riscv-tests suites for DefaultConfig in parallel:
+  mill -i -j 0 "runnable-riscv-test[freechips.rocketchip.system.TestHarness,freechips.rocketchip.system.DefaultConfig,_,_].run"
+
+  Pass/fail logs are saved in:
+  `out/runnable-riscv-test/freechips.rocketchip.system.TestHarness/<CONFIG>/<SUITE>/<EXCLUDE>/run.dest/*.passed.log`
+
+B) Run an individual bare-metal RISC-V ELF directly on the Verilator `emulator`:
+
+  EMULATOR=out/emulator/freechips.rocketchip.system.TestHarness/freechips.rocketchip.system.DefaultConfig/verilator/elf.dest/emulator
+
+  # Basic run + print total cycle count:
+  $EMULATOR -c $RISCV_TESTS_ROOT/riscv64-unknown-elf/share/riscv-tests/isa/rv64ui-p-add
+
+  # Cycle-by-cycle instruction commit trace (piped through spike-dasm):
+  $EMULATOR +verbose $RISCV_TESTS_ROOT/riscv64-unknown-elf/share/riscv-tests/isa/rv64ui-p-add 2>&1 | spike-dasm
+
+  # Timeout safeguard (kill simulation after N cycles):
+  $EMULATOR +max-cycles=100000 <path-to-your-riscv-elf>
+
+  # Show all simulator options:
+  $EMULATOR --help
+
+--------------------------------------------------------------------------------
+7. Cleaning Build Artifacts
+--------------------------------------------------------------------------------
+  make clean
+  # (Removes `out/`; `/nix/store` tool cache is preserved.)

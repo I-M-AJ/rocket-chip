@@ -5,10 +5,13 @@ MODEL ?= TestHarness
 PROJECT ?= freechips.rocketchip.system
 CFG_PROJECT ?= $(PROJECT)
 CONFIG ?= $(CFG_PROJECT).DefaultConfig
-MILL ?= mill
+MILL ?= mill -i
 
 verilog:
-	cd $(base_dir) && $(MILL) emulator[freechips.rocketchip.system.TestHarness,$(CONFIG)].mfccompiler.compile
+	cd $(base_dir) && $(MILL) "emulator[freechips.rocketchip.system.TestHarness,$(CONFIG)].mfccompiler.compile"
+
+emulator:
+	cd $(base_dir) && $(MILL) "emulator[freechips.rocketchip.system.TestHarness,$(CONFIG)].elf"
 
 clean:
 	rm -rf out/

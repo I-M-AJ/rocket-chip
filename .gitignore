@@ -15,3 +15,12 @@ docs-target/
 rocketchip.jar
 *#
 .#*
+venv/
+.bsp/
+.metals/
+.bloop/
+.idea/
+result
+result-*
+*.vcd
+*.fst
