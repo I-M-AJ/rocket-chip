@@ -24,3 +24,7 @@ result
 result-*
 *.vcd
 *.fst
+linux_boot/build/
+linux_boot/*.dtb
+linux_boot/*.elf
+

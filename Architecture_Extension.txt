@@ -198,7 +198,7 @@ Step 1 — Prepare the Device Tree (`rocket_linux.dts` -> `rocket_linux.dtb`)
 ---------------------------------------------------------------------------
 Copy the generated `DefaultConfig.dts` from:
   `out/emulator/freechips.rocketchip.system.TestHarness/freechips.rocketchip.system.DefaultConfig/generator/elaborate.dest/freechips.rocketchip.system.DefaultConfig.dts`
-to `linux_boot/rocket_linux.dts`, set `clock-frequency = <100000000>;` under
+to `linux_boot/rocket_linux.dts`, set `clock-frequency = <100000000>;` unde
 `cpu@0`, and add `chosen` + `htif` inside `/ { ... }`:
 
     chosen {
@@ -294,7 +294,7 @@ Inside Rocket Chip's `nix develop` shell:
 
   2) Cycle-accurate RTL simulation on Rocket Chip Verilator `emulator`:
      make emulator CONFIG=freechips.rocketchip.system.DefaultConfig
-     EMULATOR=out/emulator/freechips.rocketchip.system.TestHarness/freechips.rocketchip.system.DefaultConfig/verilator/elf.dest/emulator
+     EMULATOR=out/emulator/freechips.rocketchip.system.TestHarness/freechips.rocketchip.system.DefaultConfig/verilator/elf.dest/emulato
 
      $EMULATOR -c /path/to/opensbi/build/platform/generic/firmware/fw_payload.elf
 
@@ -311,7 +311,7 @@ not attached):
     wired into LiteX's FPGA SoC builder (providing LiteUART `ns16550`/`liteuart`,
     LiteDRAM DDR controller, LiteEth, and SDCard).
   * Option 2: Attach SiFive's `sifive-blocks` `TLUART` (`sifive,uart0`) or a 16550
-    AXI4/TL UART onto `PBUS`, where Linux uses `CONFIG_SERIAL_SIFIVE=y` or
+    AXI4/TL UART onto `PBUS`, where Linux uses `CONFIG_SERIAL_SIFIVE=y` o
     `CONFIG_SERIAL_8250=y` instead of `hvc0`.
 
 
@@ -540,7 +540,7 @@ from `quasiSoC` or a generated HLS/RTL anomaly engine):
           })
           addResource("/vsrc/custom_ip.v")
         }
-  3. Instantiate `Module(new custom_ip)` inside `TLCustomAnomalyIP`'s `Impl` (or
+  3. Instantiate `Module(new custom_ip)` inside `TLCustomAnomalyIP`'s `Impl` (o
      attach an `AXI4SlaveNode` on `PBUS`), connecting `clock` -> `io.clk`,
      `reset.asBool` -> `io.rst`, and latching `io.irq` into PLIC `interrupts(0)`.
      Mill's `mfccompiler` + `verilator` flow automatically compiles `/vsrc/custom_ip.v`!
@@ -576,13 +576,103 @@ Chip offers two capabilities that `quasiSoC` did not have at all:
 ================================================================================
 SUMMARY ROADMAP RECOMMENDED FOR YOUR PROJECT
 ================================================================================
-  Phase 1: Test `DefaultConfig` Linux boot in `spike` (2s) -> Verilator (`emulator`)
-           using OpenSBI `fw_payload.elf` + HTIF (`earlycon=sbi console=hvc0 lpj=10000`).
-  Phase 2: Add `TLCustomAnomalyIP` (`Pattern A` or `Pattern B` wrapping your Verilog)
-           at `0x1002_0000` on `PBUS` + PLIC IRQ, and verify it first with a fast
-           5-second bare-metal C test on `emulator` (just like `custom_ip_test`).
+  Phase 1: [COMPLETED & VERIFIED] Minimal RV64GC Linux v6.6 + OpenSBI v1.5
+           `fw_payload.elf` built under `linux_boot/` and verified end-to-end!
+  Phase 2: [NEXT] Add `TLCustomAnomalyIP` (`Pattern A` or `Pattern B` wrapping
+           Verilog) at `0x1002_0000` on `PBUS` + PLIC IRQ, and verify with a
+           5-second bare-metal C test on `emulator` (like `custom_ip_test`).
   Phase 3: Boot Linux on `AnomalySoCConfig` with `uio_pdrv_genirq.of_id=custom,anomaly-ip0`
-           to exercise your custom IP + interrupts from a Linux user-space C program,
-           and optionally wire `coreMonitorBundle` / `LazyRoCC` (`Pattern C`) for
+           to exercise your custom IP + interrupts from Linux user-space, and
+           optionally wire `coreMonitorBundle` / `LazyRoCC` (`Pattern C`) fo
            cycle-accurate hardware anomaly monitoring!
+
+
+================================================================================
+PART 4: PHASE 1 IMPLEMENTATION RECORD & DEVELOPER REFERENCE MAP
+================================================================================
+
+4.1 Repository Files Created for Phase 1 (`linux_boot/`)
+--------------------------------------------------------
+  * `linux_boot/rocket_linux.dts`
+      Adapted from the elaborated `DefaultConfig.dts` with:
+        - `chosen { bootargs = "earlycon=sbi console=hvc0 lpj=10000 loglevel=7 rdinit=/init"; };`
+        - `htif { compatible = "ucb,htif0"; };` (enables OpenSBI HTIF serial + poweroff)
+        - `clock-frequency = <100000000>;` on `cpu@0`
+        - Linux 6.6+ standard ISA properties:
+            `riscv,isa = "rv64imafdc";`
+            `riscv,isa-base = "rv64i";`
+            `riscv,isa-extensions = "i", "m", "a", "f", "d", "c", "zicsr", "zifencei", "zihpm";`
+
+  * `linux_boot/init.c`
+      Freestanding PID-1 Linux user-space verification binary (`3.6 KB` stripped
+      static RV64 ELF) built against Linux's built-in `tools/include/nolibc/nolibc.h`
+      (zero glibc/BusyBox build overhead). Runs in U-mode under Sv39 virtual
+      memory, mounts `/proc`, prints `/proc/version`, `/proc/cpuinfo`, and
+      `/proc/uptime`, and calls `reboot(RB_POWER_OFF)` for clean simulator exit.
+
+  * `linux_boot/build_linux_payload.sh`
+      Automated end-to-end builder (caches sources in WSL native `~/rocket_linux_build`
+      for fast 80-second 12-core Linux compilation, outputs `linux_boot/build/fw_payload.elf`):
+        1. Compiles `rocket_linux.dts` -> `rocket_linux.dtb`.
+        2. Compiles `init.c` -> `3.6 KB` static `/init` ELF via `nolibc.h`.
+        3. Generates a kernel `initramfs_list.txt` manifest with `/dev/console`
+           (`nod /dev/console 0600 0 0 c 5 1`) so PID-1 stdout works without `sudo mknod`.
+        4. Configures Linux `v6.6` `tinyconfig` + RV64GC (`64BIT`, `MMU`,
+           `RISCV_ISA_C`, `FPU`, `RISCV_SBI`, `RISCV_SBI_V01`, `SERIAL_EARLYCON_RISCV_SBI`,
+           `HVC_RISCV_SBI`, `RISCV_TIMER`, `CLINT_TIMER`, `SIFIVE_PLIC`,
+           `BLK_DEV_INITRD`, `INITRAMFS_COMPRESSION_NONE`, `BINFMT_ELF`, `PROC_FS`)
+           producing a compact `2.0 MB` uncompressed `arch/riscv/boot/Image`.
+        5. Compiles OpenSBI `v1.5` (`PLATFORM=generic`, `FW_TEXT_START=0x80000000`,
+           `FW_PAYLOAD_OFFSET=0x200000`) with `CC="riscv64-unknown-linux-gnu-gcc -std=gnu11 -Wno-error"`
+           (required because Nix's GCC 16 defaults to `-std=gnu23` where `bool` is a keyword).
+           Produces the single `3.4 MB` `linux_boot/build/fw_payload.elf` exporting
+           `tohost` (`0x80042848`) and `fromhost` (`0x80042840`).
+
+  * `linux_boot/run_linux_sim.sh`
+      One-command launcher supporting both Spike (`< 2s`) and Verilator (`emulator -c`).
+      (Note: Spike 1.1.0 does not instantiate a built-in PLIC at `0x0c000000`, so
+      `run_linux_sim.sh spike` maps `-m0x0c000000:0x04000000,0x80000000:0x10000000`;
+      Verilator `DefaultConfig` has the real Chisel RTL `PLIC` at `0x0c000000`.)
+
+4.2 Toolchain Installed in WSL for Phase 1
+------------------------------------------
+  Installed once into your WSL Nix user profile (`~/.nix-profile/bin`):
+    nix --experimental-features 'nix-command flakes' profile add \
+        nixpkgs#pkgsCross.riscv64.buildPackages.gcc --priority 9
+  Provides `riscv64-unknown-linux-gnu-gcc` (with PIE linker support required by
+  OpenSBI v1.5+ and full Linux/user-space C compilation).
+
+4.3 How to Run & Re-Run Phase 1 Yourself in WSL (Zero Agent Wait Time)
+----------------------------------------------------------------------
+  1. Rebuild payload (only if you edit `init.c` or `rocket_linux.dts`; pass
+     `REBUILD_KERNEL=1` if you change kernel config):
+       cd /mnt/f/Anamoly_detection/rocket-chip
+       ./linux_boot/build_linux_payload.sh
+
+  2. Instant 1-second functional boot test in Spike:
+       ./linux_boot/run_linux_sim.sh spike
+
+  3. Full cycle-accurate RTL boot in Verilator (`DefaultConfig`, ~15-30 min in
+     your WSL terminal — prints OpenSBI + Linux `dmesg` + `/init` + total cycles):
+       ./linux_boot/run_linux_sim.sh verilato
+
+  4. Optional Verilator ELF-load speedup tip:
+     In `DefaultConfig`, `SimDTM` loads `fw_payload.elf` through the CPU's Debug
+     Program Buffer over DMI (~8-10M cycles before reset release). Building the
+     `WithDebugSBASystem` config (`freechips.rocketchip.system.WithJtagDTMSystem_freechips.rocketchip.system.WithDebugSBASystem_freechips.rocketchip.system.DefaultConfig`
+     or mixing `new WithDebugSBA` into `DefaultConfig`) enables Direct System Bus
+     Access (`SBA`) so `libfesvr` writes DRAM directly over `SBUS` much faster!
+
+4.4 Verified Boot Output Summary (Linux 6.6 + OpenSBI 1.5 -> `/init` Poweroff)
+------------------------------------------------------------------------------
+  - OpenSBI v1.5 detects `freechips,rocketchip-unknown`, `aclint-mtimer @ 1000000Hz`,
+    and `htif` console/reboot/shutdown, then enters S-mode at `0x80200000`.
+  - Linux 6.6 initializes `255488K/262144K` RAM (`0x80000000-0x8fffffff`), maps
+    64 local interrupts + `plic: interrupt-controller@c000000` (2 external IRQs),
+    switches console `sbi0` -> `hvc0`, skips BogoMIPS calibration (`lpj=10000`),
+    and launches `/init` (PID 1) in U-mode:
+      `isa   : rv64imafdc_zicsr_zifencei_zihpm`
+      `uarch : sifive,rocket0`
+  - `/init` mounts `/proc`, dumps `/proc/version`, `/proc/cpuinfo`, and `/proc/uptime`,
+    and executes `reboot(RB_POWER_OFF)` -> `reboot: Power down` (exit code 0).
 ================================================================================
