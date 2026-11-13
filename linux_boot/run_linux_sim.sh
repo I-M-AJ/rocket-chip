@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # ==============================================================================
-# Run Rocket Chip RV64GC Linux (`fw_payload.elf`) on Spike or Verilato
+# Run Rocket Chip RV64GC Linux (`fw_payload.elf`) on Spike or Verilator
 # Usage:
 #   ./linux_boot/run_linux_sim.sh spike       # ~1 second ISA functional check
 #   ./linux_boot/run_linux_sim.sh verilator   # Cycle-accurate RTL simulation

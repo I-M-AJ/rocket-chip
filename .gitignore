@@ -27,4 +27,7 @@ result-*
 linux_boot/build/
 linux_boot/*.dtb
 linux_boot/*.elf
+custom_ip_test/*.elf
+custom_ip_test/*.o
+custom_ip_test/*.dump
 

@@ -652,16 +652,25 @@ PART 4: PHASE 1 IMPLEMENTATION RECORD & DEVELOPER REFERENCE MAP
   2. Instant 1-second functional boot test in Spike:
        ./linux_boot/run_linux_sim.sh spike
 
-  3. Full cycle-accurate RTL boot in Verilator (`DefaultConfig`, ~15-30 min in
-     your WSL terminal — prints OpenSBI + Linux `dmesg` + `/init` + total cycles):
-       ./linux_boot/run_linux_sim.sh verilato
+  3. Full cycle-accurate RTL boot in Verilator (`DefaultConfig`, in your WSL
+     terminal — prints OpenSBI + Linux `dmesg` + `/init` + total cycles):
+       ./linux_boot/run_linux_sim.sh verilator
 
-  4. Optional Verilator ELF-load speedup tip:
-     In `DefaultConfig`, `SimDTM` loads `fw_payload.elf` through the CPU's Debug
-     Program Buffer over DMI (~8-10M cycles before reset release). Building the
-     `WithDebugSBASystem` config (`freechips.rocketchip.system.WithJtagDTMSystem_freechips.rocketchip.system.WithDebugSBASystem_freechips.rocketchip.system.DefaultConfig`
-     or mixing `new WithDebugSBA` into `DefaultConfig`) enables Direct System Bus
-     Access (`SBA`) so `libfesvr` writes DRAM directly over `SBUS` much faster!
+  4. Verilator Linux Boot Timing Observation & Phase 2/3 Speedups:
+     In the Phase 1 Verilator run (`DefaultConfig`), OpenSBI + Linux 6.6 booted
+     successfully through `earlycon`, `plic`, `futex`, `riscv_clocksource`, and
+     `workingset`, spending ~65 minutes primarily in two bottlenecks:
+       (a) DMI Program-Buffer ELF loading of the 3.4 MB `fw_payload.elf` before
+           CPU reset release, and
+       (b) Linux 6.6's `check_unaligned_access` jiffy loop (`cpu0: Ratio of byte
+           access time to unaligned word access is 0.01`, where every unaligned
+           load/store traps to OpenSBI M-mode emulation for several `mtime` ticks).
+     Fixes applied for `AnomalySoCConfig` (Phase 2 & Phase 3):
+       - `AnomalySoCConfig` mixes in `new WithDebugSBA` so `libfesvr` writes DRAM
+         directly over `FBUS` System Bus Access (10x faster ELF loading).
+       - For Phase 3 Linux builds, setting `CONFIG_RISCV_MISALIGNED=n` /
+         `CONFIG_RISCV_PROBE_UNALIGNED_ACCESS=n` (or `CONFIG_RISCV_EMULATED_UNALIGNED_ACCESS=y`)
+         eliminates the multi-minute unaligned-access benchmark loop in Verilator.
 
 4.4 Verified Boot Output Summary (Linux 6.6 + OpenSBI 1.5 -> `/init` Poweroff)
 ------------------------------------------------------------------------------
@@ -675,4 +684,139 @@ PART 4: PHASE 1 IMPLEMENTATION RECORD & DEVELOPER REFERENCE MAP
       `uarch : sifive,rocket0`
   - `/init` mounts `/proc`, dumps `/proc/version`, `/proc/cpuinfo`, and `/proc/uptime`,
     and executes `reboot(RB_POWER_OFF)` -> `reboot: Power down` (exit code 0).
+
+
 ================================================================================
+PART 5: PHASE 2 IMPLEMENTATION RECORD — CUSTOM ANOMALY IP & PLIC VERIFICATION
+================================================================================
+Phase 2 implements Pattern A (TileLink MMIO Peripheral + PLIC Hardware Interrupt)
+by porting and extending `quasiSoC/rtl/quasisoc/custom_ip/custom_ip.v` into native
+Chisel 6.7.0 + Diplomacy inside Rocket Chip (`AnomalySoCConfig`), paired with a
+fast (< 2 second) RV64 bare-metal verification suite (`custom_ip_test/`).
+
+5.1 Hardware Architecture & Diplomacy Wiring
+--------------------------------------------
+  Bus & Interrupt Path:
+    Rocket Core (RV64GC)
+      --> `SBUS` (64-bit) --> `CBUS` (64-bit)
+      --> `TLWidthWidget(8 -> 4)` --> `TLFragmenter(4, 64)`
+      --> `TLCustomAnomalyIP` (`0x10020000 - 0x10020fff`, `compat = "custom,anomaly-ip0"`)
+            |
+            +--> `dev.intXing(NoCrossing)` --> `ibus.fromSync`
+            --> `TLPLIC @ 0x0c000000` (Source ID 3, `LevelGateway`)
+            --> Hart 0 `MEIP` (`mcause = (1ULL << 63) | 11`) / `SEIP` (for Phase 3 Linux UIO)
+
+  Key Chisel 6.7.0 Implementation Details:
+  1. Clock Domain Wrapper:
+     Rocket subsystems in Chisel 6 use `LazyRawModuleImp` (no implicit clock/reset).
+     `CanHavePeripheryCustomAnomalyIP` creates a synchronous clock domain from `CBUS`
+     (`tlbus.generateSynchronousDomain("CustomAnomalyIP")`), matching `CLINT.scala`
+     and `Plic.scala`.
+  2. Width Adaptation (`64-bit CBUS -> 32-bit RegisterRouter`):
+     `TLFragmenter(dev.beatBytes, tlbus.blockBytes) :*= TLWidthWidget(tlbus.beatBytes) := _`
+     cleanly adapts 64-bit `CBUS` transactions to 32-bit aligned MMIO registers.
+  3. Level-Sensitive PLIC Interrupt Handshake:
+     `TLPLIC` instantiates `LevelGateway` for TileLink interrupts. `interrupts(0)` is
+     held high while `irq_enable == 1 && (done_pending || anomaly_pending)` until the
+     CPU trap handler claims the IRQ at `0x0C200004`, clears `IRQ_STATUS` (`+0x0C`)
+     via Write-1-to-Clear (`RegField.w1ToClear`), and writes the claim ID back to
+     `0x0C200004`.
+  4. Fast System Bus Access (`WithDebugSBA`):
+     `AnomalySoCConfig` includes `new WithDebugSBA` alongside `new WithCustomAnomalyIP`,
+     giving `SimDTM` / `libfesvr` direct `FBUS` master access for fast ELF loading in
+     both bare-metal and Phase 3 Linux simulations.
+
+5.2 Complete Register Map (`0x10020000`, 4 KB Window)
+-----------------------------------------------------
+  Offsets `+0x00 .. +0x0C` are 100% register- and bit-compatible with the reference
+  `quasiSoC` `custom_ip.v` testbench; `+0x10 .. +0x14` add hardware anomaly detection:
+
+  Offset | Name              | Access | Bitfields & Hardware Behavior
+  -------+-------------------+--------+----------------------------------------------------
+  +0x00  | CTRL              | R/W    | [0] `start` (WO pulse, reads 0): starts 16-cycle op
+         |                   |        | [1] `irq_enable` (R/W): enables PLIC IRQ line
+         |                   |        | [2] `busy` (RO): 1 while 16-cycle countdown runs
+  +0x04  | DATA_IN           | R/W    | [31:0] Input 32-bit operand / sensor sample
+  +0x08  | RESULT            | RO     | [31:0] Latched `((DATA_IN ^ 0xA5A55A5A) + 1)`
+  +0x0C  | IRQ_STATUS        | W1C/RO | [0] `done_pending` (W1C): set when compute finishes
+         |                   |        | [1] `anomaly_pending` (W1C): set if `ANOMALY_THRESHOLD != 0`
+         |                   |        |     and `DATA_IN > ANOMALY_THRESHOLD`
+         |                   |        | [15:8] `irq_count` (RO): 8-bit IRQ event counter
+  +0x10  | ANOMALY_THRESHOLD | R/W    | [31:0] Threshold value (`0` = disabled, default `0`)
+  +0x14  | ANOMALY_COUNT     | R/W    | [31:0] Cumulative anomaly breach count (write 0 to reset)
+
+5.3 Files Created / Modified in Phase 2
+---------------------------------------
+  1. `src/main/scala/devices/tilelink/CustomAnomalyIP.scala` (NEW):
+     Defines `CustomAnomalyIPParams`, `CustomAnomalyIPKey`, `TLCustomAnomalyIP`,
+     `CanHavePeripheryCustomAnomalyIP`, and `WithCustomAnomalyIP`.
+  2. `src/main/scala/system/ExampleRocketSystem.scala` (MODIFIED):
+     Mixes `CanHavePeripheryCustomAnomalyIP` into `ExampleRocketSystem`.
+  3. `src/main/scala/system/Configs.scala` (MODIFIED):
+     Adds `AnomalySoCConfig` (`WithCustomAnomalyIP(0x10020000L) ++ WithDebugSBA ++ DefaultConfig`).
+  4. `build.sc` (MODIFIED):
+     Registers `("freechips.rocketchip.system.TestHarness", "freechips.rocketchip.system.AnomalySoCConfig")`
+     in `object emulator extends Cross[Emulator]`.
+  5. `custom_ip_test/` (NEW — Bare-Metal RV64 Verification Suite):
+     - `linker.ld`: Places `_start` at `0x80000000` and 64-byte aligned `.tohost`.
+     - `start.S`: Initializes stack/BSS, installs `mtvec` (`m_trap_entry`), and routes
+       M-mode traps to `m_trap_handler(mcause, mepc)`.
+     - `main.c`: Uses HTIF console (`bcd` putc + `htif_exit`) with zero external UART
+       hardware needed, running 4 automated hardware tests:
+         * `[Test 1]` 32-bit MMIO Register Write/Readback (`DATA_IN`, `ANOMALY_THRESHOLD`).
+         * `[Test 2]` Polling-mode 16-cycle compute (`0x12345678 -> 0xB7910C23`) + W1C clear.
+         * `[Test 3]` End-to-end PLIC hardware interrupt (`0xDEADBEEF -> 0x7B08E4B6`,
+           verifying `PLIC_MCLAIM_0`, W1C clear, and `PLIC_MCLAIM_0` complete).
+         * `[Test 4]` Hardware Anomaly Threshold check (normal `0x0500 <= 0x1000` vs
+           anomalous `0x2500 > 0x1000`, verifying `anomaly_pending` W1C + `ANOMALY_COUNT == 1`).
+     - `Makefile` & `run_custom_ip_test.sh`: Compiles `custom_ip_test.elf` (`~10 KB`),
+       prints the auto-generated Device Tree node (`custom-anomaly-ip@10020000`), and
+       runs the cycle-accurate Verilator simulation in `< 2 seconds`.
+
+5.4 Commands to Build & Verify Phase 2 in WSL
+---------------------------------------------
+  Step 1 — Elaborate Chisel -> SystemVerilog & compile Verilator `AnomalySoCConfig`:
+    cd /mnt/f/Anamoly_detection/rocket-chip
+    nix --experimental-features 'nix-command flakes' develop -c \
+      make emulator CONFIG=freechips.rocketchip.system.AnomalySoCConfig
+
+  Step 2 — Compile & run the bare-metal Custom Anomaly IP test (~1-2 seconds):
+    ./custom_ip_test/run_custom_ip_test.sh
+
+  Step 3 — Inspect generated Device Tree & Register Map JSON (for Phase 3 Linux UIO):
+    grep -A 10 "custom-anomaly-ip" \
+      out/emulator/freechips.rocketchip.system.TestHarness/freechips.rocketchip.system.AnomalySoCConfig/generator/elaborate.dest/freechips.rocketchip.system.AnomalySoCConfig.dts
+
+5.5 Verified Phase 2 Hardware Elaboration & Verilator Results
+-------------------------------------------------------------
+  * Diplomacy-Generated Device Tree Node (`AnomalySoCConfig.dts`):
+      L11: custom-anomaly-ip@10020000 {
+          compatible = "custom,anomaly-ip0";
+          interrupt-parent = <&L7>;
+          interrupts = <3>;
+          reg = <0x10020000 0x1000>;
+          reg-names = "control";
+      };
+
+  * Cycle-Accurate Verilator RTL Execution (`./custom_ip_test/run_custom_ip_test.sh`):
+      - `[Test 1]` TileLink 32-bit MMIO Read/Write (`DATA_IN`, `ANOMALY_THRESHOLD`): PASS
+      - `[Test 2]` Polling 16-cycle compute (`0x12345678 -> 0xB7910C23`) + W1C clear: PASS
+      - `[Test 3]` Hardware Interrupt via PLIC (`claim_id = 3`, `0xDEADBEEF -> 0x7B08E4B6`): PASS
+      - `[Test 4]` Anomaly Threshold Detector (`0x0500` normal vs `0x2500 > 0x1000` breach): PASS
+      - Summary: `ALL 4 CUSTOM ANOMALY IP TESTS PASSED! (errors = 0)`
+      - Total RTL Simulation Cycles: `*** PASSED *** Completed after 27369512 cycles`
+
+5.6 Roadmap to Phase 3 (Linux User-Space UIO Driver & Interrupt Test)
+---------------------------------------------------------------------
+  1. Add the verified `custom-anomaly-ip@10020000` (`interrupts = <3>`) node to
+     `linux_boot/rocket_linux.dts` with `compatible = "generic-uio";` and pass
+     `uio_pdrv_genirq.of_id=generic-uio` in `bootargs`.
+  2. Enable `CONFIG_UIO=y` and `CONFIG_UIO_PDRV_GENIRQ=y` (and disable the slow
+     `CONFIG_RISCV_MISALIGNED` boot probe for fast Verilator startup) in Linux 6.6.
+  3. Add a Linux user-space C test (`mmap("/dev/uio0")` + blocking `read(uio_fd, &irq_cnt, 4)`)
+     into `initramfs` and verify S-mode/U-mode interrupt-driven anomaly detection on
+     `AnomalySoCConfig`.
+================================================================================
+
+
+

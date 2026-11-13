@@ -133,3 +133,19 @@ B) Run an individual bare-metal RISC-V ELF directly on the Verilator `emulator`:
 --------------------------------------------------------------------------------
   make clean
   # (Removes `out/`; `/nix/store` tool cache is preserved.)
+
+--------------------------------------------------------------------------------
+8. Linux Boot (Phase 1) & Custom Anomaly IP Verification (Phase 2)
+--------------------------------------------------------------------------------
+  # Phase 1: Build & boot minimal RV64GC Linux 6.6 + OpenSBI v1.5 payload
+  ./linux_boot/build_linux_payload.sh
+  ./linux_boot/run_linux_sim.sh spike       # ~1s functional ISA boot check
+  ./linux_boot/run_linux_sim.sh verilator   # Cycle-accurate RTL boot
+
+  # Phase 2: Build AnomalySoCConfig (TLCustomAnomalyIP @ 0x10020000 + PLIC IRQ 3)
+  nix --experimental-features 'nix-command flakes' develop -c \
+    make emulator CONFIG=freechips.rocketchip.system.AnomalySoCConfig
+
+  # Compile & run the RV64 bare-metal MMIO + polling + PLIC IRQ + anomaly test:
+  ./custom_ip_test/run_custom_ip_test.sh
+

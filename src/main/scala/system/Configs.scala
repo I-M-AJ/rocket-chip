@@ -4,6 +4,7 @@
 package freechips.rocketchip.system
 
 import org.chipsalliance.cde.config.Config
+import freechips.rocketchip.devices.tilelink.WithCustomAnomalyIP
 import freechips.rocketchip.subsystem._
 import freechips.rocketchip.rocket.{WithNBigCores, WithNMedCores, WithNSmallCores, WithRV32, WithFP16, WithHypervisor, With1TinyCore, WithScratchpadsOnly, WithCloneRocketTiles, WithB}
 
@@ -22,6 +23,12 @@ class BaseConfig extends Config(
 )
 
 class DefaultConfig extends Config(new WithNBigCores(1) ++ new WithCoherentBusTopology ++ new BaseConfig)
+
+class AnomalySoCConfig extends Config(
+  new WithCustomAnomalyIP(0x10020000L) ++
+  new WithDebugSBA ++
+  new DefaultConfig
+)
 
 class DefaultBufferlessConfig extends Config(new WithBufferlessBroadcastHub ++ new DefaultConfig)
 class DefaultSmallConfig extends Config(new WithNSmallCores(1) ++ new WithCoherentBusTopology ++ new BaseConfig)
