@@ -7,7 +7,7 @@
 	model = "freechips,rocketchip-unknown";
 
 	chosen {
-		bootargs = "earlycon=sbi console=hvc0 lpj=10000 loglevel=7 rdinit=/init";
+		bootargs = "earlycon=sbi console=hvc0 lpj=10000 loglevel=7 uio_pdrv_genirq.of_id=generic-uio rdinit=/init";
 	};
 
 	htif {
@@ -90,7 +90,14 @@
 			reg = <0xc000000 0x4000000>;
 			reg-names = "control";
 			riscv,max-priority = <3>;
-			riscv,ndev = <2>;
+			riscv,ndev = <3>;
+		};
+		custom-anomaly-ip@10020000 {
+			compatible = "generic-uio";
+			interrupt-parent = <&L7>;
+			interrupts = <3>;
+			reg = <0x10020000 0x1000>;
+			reg-names = "control";
 		};
 		L12: mmio-port-axi4@60000000 {
 			#address-cells = <1>;

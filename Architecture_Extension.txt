@@ -816,6 +816,37 @@ fast (< 2 second) RV64 bare-metal verification suite (`custom_ip_test/`).
   3. Add a Linux user-space C test (`mmap("/dev/uio0")` + blocking `read(uio_fd, &irq_cnt, 4)`)
      into `initramfs` and verify S-mode/U-mode interrupt-driven anomaly detection on
      `AnomalySoCConfig`.
+
+================================================================================
+PART 6: PHASE 3 IMPLEMENTATION RECORD — LINUX UIO DRIVER & U-MODE VERIFICATION
+================================================================================
+Phase 3 exposes `TLCustomAnomalyIP` (`0x10020000`, PLIC IRQ `3`) to Linux 6.6
+user-space via the generic Userspace I/O (`uio_pdrv_genirq`) driver on
+`AnomalySoCConfig`.
+
+6.1 Files Updated for Phase 3
+-----------------------------
+  1. `linux_boot/rocket_linux.dts`:
+     - Added `uio_pdrv_genirq.of_id=generic-uio` to `chosen/bootargs`.
+     - Updated `plic@c000000` `riscv,ndev = <3>;`.
+     - Added `custom-anomaly-ip@10020000` (`compatible = "generic-uio"`,
+       `interrupts = <3>`, `reg = <0x10020000 0x1000>`).
+  2. `linux_boot/build_linux_payload.sh`:
+     - Enabled `CONFIG_UIO=y` and `CONFIG_UIO_PDRV_GENIRQ=y`.
+     - Disabled `CONFIG_RISCV_MISALIGNED` and `CONFIG_RISCV_PROBE_UNALIGNED_ACCESS`
+       to speed up Verilator Linux boot.
+  3. `linux_boot/init.c`:
+     - Mounts `devtmpfs` on `/dev`, opens `/dev/uio0`, `mmap()`s `4 KB` MMIO,
+       and runs UIO tests from Linux U-mode.
+  4. `linux_boot/run_linux_sim.sh`:
+     - Defaulted `CONFIG` to `freechips.rocketchip.system.AnomalySoCConfig`.
+
+6.2 Verified Phase 3 Verilator Results (`AnomalySoCConfig`)
+-----------------------------------------------------------
+  * `[UIO Test 1]` `DATA_IN` R/W (`0x12345678`): `PASS`
+  * `[UIO Test 2]` Polling 16-cycle compute (`0xb7910c23`): `PASS`
+  * `[UIO Test 3]` Linux kernel PLIC IRQ `3` -> `/dev/uio0` blocking `read()`
+    (`read=4 cnt=1 status=0x101 RESULT=0x7b08e4b6`): `PASS`
 ================================================================================
 
 

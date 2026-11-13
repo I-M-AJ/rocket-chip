@@ -11,7 +11,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 PAYLOAD="${PAYLOAD:-$SCRIPT_DIR/build/fw_payload.elf}"
-CONFIG="${CONFIG:-freechips.rocketchip.system.DefaultConfig}"
+CONFIG="${CONFIG:-freechips.rocketchip.system.AnomalySoCConfig}"
 MODE="${1:-verilator}"
 
 if [ ! -f "$PAYLOAD" ]; then

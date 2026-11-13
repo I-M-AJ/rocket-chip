@@ -91,7 +91,11 @@ make ARCH=riscv CROSS_COMPILE="$CROSS" tinyconfig
     --enable DEVTMPFS \
     --enable TMPFS \
     --enable FUTEX \
-    --enable MULTIUSER
+    --enable MULTIUSER \
+    --enable UIO \
+    --enable UIO_PDRV_GENIRQ \
+    --disable RISCV_MISALIGNED \
+    --disable RISCV_PROBE_UNALIGNED_ACCESS
 
 make ARCH=riscv CROSS_COMPILE="$CROSS" olddefconfig
 echo "--- Active Key Kernel Configs ---"
