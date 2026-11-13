@@ -1,0 +1,588 @@
+================================================================================
+Rocket Chip SoC — Present Architecture, Linux Boot in Verilator, and Custom IP
+Extension Guide (Compared with Reference `quasiSoC`)
+================================================================================
+
+This document covers three topics for this Rocket Chip workarea:
+  1. Present Rocket Chip SoC Architecture & Exact Memory Map (`DefaultConfig`)
+  2. How to Boot Linux on Rocket Chip & Test It in Verilator (vs. `quasiSoC`)
+  3. How to Add Custom IP (MMIO + Interrupts, Verilog BlackBox, RoCC, & Trace
+     Monitors), directly mapped from the `custom_ip` work in `quasiSoC`
+
+================================================================================
+PART 1: PRESENT ROCKET CHIP SoC ARCHITECTURE
+================================================================================
+
+1.1 Generator Philosophy (Chisel + CDE + Diplomacy)
+---------------------------------------------------
+Unlike `quasiSoC` (which is a fixed-RTL RV32IMA multi-cycle processor with
+hand-edited bus decoders in `lowmapper.v`/`highmapper.v`), Rocket Chip is a
+parameterized SoC hardware generator written in Scala/Chisel (`Chisel 6.7.0` +
+CIRCT `firtool`):
+  * Chisel: Constructs synthesizable RTL modules.
+  * CDE (`Config` mixins in `src/main/scala/system/Configs.scala`): Composes SoC
+    variants (word width, core count, caches, VM, buses, ports, accelerators).
+  * Diplomacy (`LazyModule`): Runs two-phase elaboration BEFORE emitting Verilog
+    to automatically negotiate bus widths, source/sink IDs, PLIC interrupt counts,
+    address decoders, and generate the exact Device Tree (`.dts`) and JSON
+    memory map (`memmap.json`).
+
+1.2 Hierarchical Block Diagram (`TestHarness` -> `Rocket` Core)
+---------------------------------------------------------------
++-------------------------------------------------------------------------------+
+| TestHarness (`src/main/scala/system/TestHarness.scala`)                       |
+|   - SimAXIMem (256 MB DRAM @ 0x8000_0000) + SimAXIMem (4 KB MMIO @ 0x6000_0000)|
+|   - SimDTM / SimJTAG DPI-C bridge (`SimDTM.cc` <-> `libfesvr` host loader)    |
+|  +-------------------------------------------------------------------------+  |
+|  | ExampleRocketSystem (`src/main/scala/system/ExampleRocketSystem.scala`) |  |
+|  |  extends RocketSubsystem (`src/main/scala/subsystem/RocketSubsystem.scala`)|
+|  |                                                                         |  |
+|  |   +---------------------------+     +---------------------------+       |  |
+|  |   |       RocketTile 0        |     |       RocketTile N        |       |  |
+|  |   | +-----------------------+ |     | +-----------------------+ |       |  |
+|  |   | | Rocket 5-Stage Core   | | ... | | Rocket 5-Stage Core   | |       |  |
+|  |   | | IF -> ID -> EX ->     | |     | | + MulDiv + IEEE FPU   | |       |  |
+|  |   | |       MEM -> WB       | |     | +-----------------------+ |       |  |
+|  |   | +-----------------------+ |     | | LazyRoCC Coprocessor  | |       |  |
+|  |   | | BTB/BHT/RAS | I-Cache | |     | | CoreMonitor / Trace   | |       |  |
+|  |   | | Split TLBs  | D-Cache | |     | | BEU / ITIM / DTIM     | |       |  |
+|  |   | | Shared Hardware PTW   | |     | +-----------------------+ |       |  |
+|  |   +-------------+-------------+     +-------------+-------------+       |  |
+|  |                 | TileLink Coherent (TL-C)        |                     |  |
+|  |                 v                                 v                     |  |
+|  |  =========+=============================================+====== SBUS    |  |
+|  |           ^                     |                       |    (System Bus)|
+|  |           |                     |                       v               |  |
+|  |        +------+              +------+          +------------------+     |  |
+|  |        | FBUS |              | CBUS |          |   COH Manager    |     |  |
+|  |        +------+              +------+          | (`BroadcastHub`) |     |  |
+|  |           ^                  |  |  |           +--------+---------+     |  |
+|  |           |         +--------+  |  +--------+           v               |  |
+|  |    `l2_frontend`    v           v           v        +------+           |  |
+|  |     AXI4 Slave   BootROM      CLINT       PLIC       | MBUS |           |  |
+|  |     (DMA In)    (0x10000)  (0x02000000) (0x0C000000) +------+           |  |
+|  |                     + Debug (0x0) + Error (0x3000)      |               |  |
+|  |                                 |                       v               |  |
+|  |                                 v                    TLToAXI4           |  |
+|  |                              +------+                   |               |  |
+|  |                              | PBUS | (Periphery Bus)   |               |  |
+|  |                              +------+                   |               |  |
+|  |                                 | (TLToAXI4)            |               |  |
+|  +---------------------------------|-----------------------|---------------+  |
+|                                    v                       v                  |
+|                             `mmio_axi4` Port         `mem_axi4` Port(s)       |
+|                              (0x6000_0000)            (0x8000_0000)           |
++-------------------------------------------------------------------------------+
+
+1.3 Inside the `Rocket` Core & `RocketTile` (`DefaultConfig`)
+-------------------------------------------------------------
+From the elaborated `DefaultConfig.dts` in `out/emulator/.../elaborate.dest/`:
+  * Pipeline       : Single-issue, in-order 5-stage scalar pipeline:
+                     1. IF (Frontend PC gen, BTB/BHT/RAS branch prediction, I-$)
+                     2. ID (RVC 16->32-bit decompression in `IBuf`, decode, regfile)
+                     3. EX (ALU, branch resolution, pipelined MulDiv, FPU/RoCC issue)
+                     4. MEM (D-Cache lookup, TLB check, AMO atomics)
+                     5. WB (Register writeback, precise trap/CSR commit, trace out)
+  * ISA String     : `rv64imafdczicsr_zifencei_zihpm_xrocket` (64-bit RV64GC)
+  * Privilege & VM : M / S / U modes + `riscv,sv39` 3-level MMU + 8 PMP entries
+  * Caches & TLBs  : 16 KB 4-way L1 I-Cache (64B lines) + 32-entry I-TLB
+                     16 KB 4-way L1 D-Cache (64B lines) + 32-entry D-TLB
+                     Shared hardware Page Table Walker (`PTW`) with PTE cache
+  * Interconnect   : 5 TileLink buses (64-bit / 8-byte beat width, 64B cache blocks):
+                     - `SBUS`: High-speed coherent backbone between tiles
+                     - `COH` + `MBUS`: Banked `BroadcastHub` snoop coherence -> DRAM
+                     - `FBUS`: Coherent inbound DMA slave bus
+                     - `CBUS`: Core-complex control slaves (BootROM, CLINT, PLIC, Debug)
+                     - `PBUS`: Peripheral MMIO bus (100 MHz nominal DTS clock)
+
+1.4 Exact Physical Memory Map (`DefaultConfig`)
+-----------------------------------------------
+  Base Address   Size        Permissions   Device / Description
+  ------------   ---------   -----------   ------------------------------------
+  0x0000_0000    4 KB        RWX, Atomic   `debug-controller@0` (RISC-V Debug 0.13)
+  0x0000_3000    4 KB        RWX, Atomic   `error-device@3000` (Bus error sink)
+  0x0001_0000    64 KB       R-X           `rom@10000` (BootROM + appended `.dtb`)
+                                             - `0x10000`: `_start` (jumps to 0x80000000)
+                                             - `0x10040`: `_hang` (power-on reset vector)
+                                             - `0x10080`: `_dtb` (auto-embedded DTB)
+  0x0200_0000    64 KB       RW-, Atomic   `clint@2000000` (Timer `mtime`/`mtimecmp` + IPI)
+  0x0C00_0000    64 MB       RW-, Atomic   `interrupt-controller@c000000` (RISC-V PLIC)
+  0x6000_0000    512 MB      RWX (Uncached)`mmio-port-axi4@60000000` (External MMIO AXI4)
+  0x8000_0000    256 MB      RWX, Cached   `memory@80000000` (Main AXI4 DRAM)
+
+1.5 Built-in SoC Presets (`src/main/scala/system/Configs.scala`)
+----------------------------------------------------------------
+  * `DefaultConfig`      : 1x RV64GC BigCore (Sv39 MMU, FPU, 16KB I$/D$) — **Linux-capable**
+  * `DualCoreConfig`     : 2x RV64GC BigCores with coherent SMP snooping — **SMP Linux-capable**
+  * `HypervisorConfig`   : RV64GCH (adds RISC-V Hypervisor `H` extension for KVM)
+  * `RoccExampleConfig`  : `DefaultConfig` + 4 example `LazyRoCC` custom accelerators
+  * `DefaultSmallConfig` : 1x RV64IMAC SmallCore (`useVM=false`, no FPU, 4KB caches) — Bare-metal/RTOS only
+  * `DefaultRV32Config`  : 1x RV32GC BigCore (Sv32 MMU)
+  * `TinyConfig`         : 1x RV32IMAC TinyCore (scratchpad only, no DRAM port)
+  * `LitexConfigBig*`    : Multi-core Linux-ready Rocket configs tailored for LiteX SoC integration
+
+1.6 Side-by-Side Comparison: `quasiSoC` vs. `rocket-chip` (`DefaultConfig`)
+---------------------------------------------------------------------------
+  Feature               `quasiSoC` (Reference)            `rocket-chip` (`DefaultConfig`)
+  -------------------   -------------------------------   --------------------------------------
+  CPU Architecture      RV32IMA multi-cycle (`pcpu`)      RV64GC 5-stage pipelined (`Rocket`)
+  Virtual Memory        Custom Sv32 (`mmu.v`) / No-MMU    Standard RISC-V Sv39 (`PTW` + split TLBs)
+  Mainline Linux        Requires RV32/No-MMU patches      Unmodified mainline RV64 Linux kernel
+  Caches                Uncached / simple BRAM/SDRAM      Coherent 16KB L1 I$ + 16KB L1 D$ (`TL-C`)
+  On-Chip Bus           Custom `highmapper`/`lowmapper`   Standardized Diplomatic TileLink + AXI4
+  Interrupts            `aclint` + custom `interrupt_unit`Standard RISC-V `CLINT` + `PLIC`
+  Payload Loading       `xxd` -> `/tmp/meminit.dat`       `libfesvr` + `SimDTM` loads ELF via Debug
+  Default Sim Console   `uartsim.v` @ `0x9300_0000`       HTIF (`tohost`/`fromhost`) via `libfesvr`
+                                                          (or attach UART on `PBUS` / `mmio_axi4`)
+
+
+================================================================================
+PART 2: BOOTING LINUX ON ROCKET CHIP & TESTING IN VERILATOR
+================================================================================
+
+2.1 Can We Compile with Verilator and Boot Basic Linux Like `quasiSoC`?
+-----------------------------------------------------------------------
+YES. In fact, `DefaultConfig` (already compiled in your `out/` directory!) has
+everything required by the CPU/memory side of mainline 64-bit RISC-V Linux:
+  - RV64IMAFDC (`rv64gc`) + M/S/U privilege modes
+  - Sv39 MMU + PMP
+  - Standard RISC-V CLINT (`0x0200_0000`) & PLIC (`0x0C00_0000`)
+  - 256 MB coherent DRAM (`0x8000_0000` - `0x8FFF_FFFF`)
+
+However, there are THREE important architectural differences from `quasiSoC`'s
+`./run_sim.sh mmukernel Image dtb sbi.bin` flow that you must follow:
+
+  1. Single ELF Payload (`fw_payload.elf`) instead of `/tmp/meminit.dat`:
+     Rocket's Verilator `emulator` uses `libfesvr` (`SimDTM.cc`), which expects an
+     ELF executable on the command line, loads its segments into `0x8000_0000`
+     DRAM, sets `a0 = hartid`, `a1 = dtb_addr`, and jumps to `0x8000_0000` via
+     `bootrom/bootrom.S`. Building **OpenSBI** with `FW_PAYLOAD=y` bundles
+     OpenSBI (M-mode) + your Device Tree (`FW_FDT_PATH`) + Linux `Image`
+     (with embedded BusyBox `initramfs`) into ONE self-contained `fw_payload.elf`!
+
+  2. Console Output via HTIF (`ucb,htif0` + SBI `hvc0`) — Zero RTL Edits Needed!
+     Standalone `DefaultConfig` does NOT instantiate a physical `ns16550a` UART
+     in `DefaultConfig.dts` (unlike `quasiSoC`'s `uartsim.v` at `0x9300_0000`).
+     Instead, Rocket's Verilator `emulator` (`libfesvr`) natively supports the
+     **HTIF (Host-Target Interface)** protocol whenever the loaded ELF exports
+     `tohost` and `fromhost` symbols!
+       Linux `printk`/shell (`earlycon=sbi console=hvc0`)
+         --> SBI Console `ecall`
+         --> OpenSBI generic HTIF driver (`ucb,htif0` in DTB)
+         --> `tohost` / `fromhost` memory mailbox
+         --> `libfesvr` (`emulator`) --> directly prints/reads in your WSL terminal!
+     (If you later want a hardware UART peripheral for FPGA synthesis, see
+     Section 2.4 below.)
+
+  3. Simulation Speed & Kernel Tuning (Crucial for Verilator):
+     Cycle-accurate Verilator simulation of a full 64-bit out-of-box Rocket SoC
+     runs at roughly ~5–25 kHz (5,000–25,000 cycles/sec).
+     - An untuned distro `defconfig` kernel takes 200M+ cycles (hours!).
+     - A stripped **`tinyconfig`-based RV64 kernel** + uncompressed `initramfs` +
+       `lpj=10000` in `bootargs` (which skips Linux's multi-million-cycle BogoMIPS
+       delay calibration loop!) boots to a `/ #` prompt in ~25M–60M cycles
+       (~25–60 minutes in Verilator — similar to `quasiSoC`'s `timeout=3600`s).
+     - Even better: `nix develop` already includes **`spike`** (the RISC-V ISA
+       simulator), which boots the EXACT same `fw_payload.elf` in **< 2 seconds**
+       so you can verify your kernel/DTB/rootfs immediately before launching the
+       cycle-accurate Verilator run!
+
+--------------------------------------------------------------------------------
+2.2 Step-by-Step Recipe: Build & Boot Minimal Linux on Verilator (`DefaultConfig`)
+--------------------------------------------------------------------------------
+Run all steps inside WSL (`nix develop` provides `dtc`, `spike`, Verilator, etc.;
+for building Linux & BusyBox, install `riscv64-linux-gnu-gcc` or use Ubuntu's
+`sudo apt install gcc-riscv64-linux-gnu bc bison flex libssl-dev libelf-dev cpio`):
+
+Step 1 — Prepare the Device Tree (`rocket_linux.dts` -> `rocket_linux.dtb`)
+---------------------------------------------------------------------------
+Copy the generated `DefaultConfig.dts` from:
+  `out/emulator/freechips.rocketchip.system.TestHarness/freechips.rocketchip.system.DefaultConfig/generator/elaborate.dest/freechips.rocketchip.system.DefaultConfig.dts`
+to `linux_boot/rocket_linux.dts`, set `clock-frequency = <100000000>;` under
+`cpu@0`, and add `chosen` + `htif` inside `/ { ... }`:
+
+    chosen {
+        bootargs = "earlycon=sbi console=hvc0 lpj=10000 loglevel=8 rdinit=/init";
+    };
+
+    htif {
+        compatible = "ucb,htif0";
+    };
+
+Compile it to a binary `.dtb`:
+    dtc -I dts -O dtb -o rocket_linux.dtb rocket_linux.dts
+
+Step 2 — Create a Minimal Initramfs (`initramfs.cpio`)
+------------------------------------------------------
+Either build static BusyBox (`ARCH=riscv CROSS_COMPILE=riscv64-linux-gnu-` with
+`CONFIG_STATIC=y`), OR for a tiny 20-line smoke-test `/init` program (compiles in
+1 second with `riscv64-linux-gnu-gcc -static` and requires zero BusyBox build!):
+
+    // init.c — minimal Linux PID 1 user-space test
+    #include <unistd.h>
+    #include <sys/reboot.h>
+    int main(void) {
+        const char msg[] = "\n*** HELLO FROM LINUX USER-SPACE ON ROCKET CHIP VERILATOR! ***\n\n";
+        write(1, msg, sizeof(msg) - 1);
+        sync();
+        reboot(RB_POWER_OFF); // cleanly exits Verilator via OpenSBI HTIF reset!
+        return 0;
+    }
+
+Package into `initramfs.cpio`:
+    mkdir -p rootfs/dev
+    riscv64-linux-gnu-gcc -O2 -static -o rootfs/init init.c
+    (cd rootfs && find . | cpio -o -H newc > ../initramfs.cpio)
+
+Step 3 — Build Minimal RV64 Linux Kernel (`Image`)
+--------------------------------------------------
+Clone Linux (e.g. `git clone --depth 1 --branch v6.6 https://github.com/torvalds/linux.git`):
+
+    cd linux
+    make ARCH=riscv CROSS_COMPILE=riscv64-linux-gnu- tinyconfig
+
+Enable ONLY the essential RV64 + Sv39 + SBI Console + Initramfs options (via
+`make ARCH=riscv menuconfig` or `./scripts/config`):
+  - `CONFIG_64BIT=y`
+  - `CONFIG_MMU=y`
+  - `CONFIG_RISCV_SBI=y`
+  - `CONFIG_SERIAL_EARLYCON=y`
+  - `CONFIG_SERIAL_EARLYCON_RISCV_SBI=y`
+  - `CONFIG_HVC_DRIVER=y`
+  - `CONFIG_HVC_RISCV_SBI=y`          <-- `/dev/hvc0` console over OpenSBI->HTIF
+  - `CONFIG_TTY=y`
+  - `CONFIG_PRINTK=y`
+  - `CONFIG_BLK_DEV_INITRD=y`
+  - `CONFIG_INITRAMFS_SOURCE="/full/path/to/initramfs.cpio"`
+  - `CONFIG_BINFMT_ELF=y`
+  - `CONFIG_PROC_FS=y`, `CONFIG_SYSFS=y`, `CONFIG_DEVTMPFS=y`, `CONFIG_DEVTMPFS_MOUNT=y`
+
+Compile the uncompressed `Image`:
+    make ARCH=riscv CROSS_COMPILE=riscv64-linux-gnu- -j$(nproc) Image
+
+Step 4 — Bundle into OpenSBI `fw_payload.elf` (with HTIF Enabled)
+-----------------------------------------------------------------
+Clone OpenSBI (`git clone --depth 1 --branch v1.4 https://github.com/riscv-software-src/opensbi.git`):
+
+Ensure `platform/generic/configs/defconfig` has:
+  - `CONFIG_FDT_SERIAL_HTIF=y`
+  - `CONFIG_FDT_RESET_HTIF=y`
+And note: OpenSBI's HTIF driver uses weak/global `tohost` and `fromhost` symbols
+(verify with `riscv64-linux-gnu-nm build/platform/generic/firmware/fw_payload.elf | grep tohost`).
+
+Build `fw_payload.elf`:
+    cd opensbi
+    make PLATFORM=generic \
+         CROSS_COMPILE=riscv64-linux-gnu- \
+         FW_TEXT_START=0x80000000 \
+         FW_PAYLOAD=y \
+         FW_PAYLOAD_OFFSET=0x200000 \
+         FW_PAYLOAD_PATH=/full/path/to/linux/arch/riscv/boot/Image \
+         FW_FDT_PATH=/full/path/to/rocket_linux.dtb \
+         -j$(nproc)
+
+Output ELF:
+    `opensbi/build/platform/generic/firmware/fw_payload.elf`
+
+Step 5 — Instant 2-Second Verification in `spike`, Then Run in Verilator!
+-------------------------------------------------------------------------
+Inside Rocket Chip's `nix develop` shell:
+
+  1) Fast functional check in Spike (< 2 seconds):
+     spike --isa=rv64imafdczicsr_zifencei -m0x80000000:0x10000000 \
+           /path/to/opensbi/build/platform/generic/firmware/fw_payload.elf
+
+  2) Cycle-accurate RTL simulation on Rocket Chip Verilator `emulator`:
+     make emulator CONFIG=freechips.rocketchip.system.DefaultConfig
+     EMULATOR=out/emulator/freechips.rocketchip.system.TestHarness/freechips.rocketchip.system.DefaultConfig/verilator/elf.dest/emulator
+
+     $EMULATOR -c /path/to/opensbi/build/platform/generic/firmware/fw_payload.elf
+
+  You will see OpenSBI banner -> Linux `earlycon` boot messages -> `*** HELLO FROM
+  LINUX USER-SPACE ON ROCKET CHIP VERILATOR! ***` -> clean `reboot(RB_POWER_OFF)`
+  exit with total cycle count printed!
+
+2.3 Optional: Hardware UART Linux Boot (Like `quasiSoC` / FPGA Deployment)
+--------------------------------------------------------------------------
+When moving from Verilator simulation to an FPGA board (where `libfesvr`/HTIF is
+not attached):
+  * Option 1: Use Rocket Chip's built-in **LiteX configurations** (`LitexConfigBig1x1`
+    in `src/main/scala/system/Litex.scala`), which generate Verilog specifically
+    wired into LiteX's FPGA SoC builder (providing LiteUART `ns16550`/`liteuart`,
+    LiteDRAM DDR controller, LiteEth, and SDCard).
+  * Option 2: Attach SiFive's `sifive-blocks` `TLUART` (`sifive,uart0`) or a 16550
+    AXI4/TL UART onto `PBUS`, where Linux uses `CONFIG_SERIAL_SIFIVE=y` or
+    `CONFIG_SERIAL_8250=y` instead of `hvc0`.
+
+
+================================================================================
+PART 3: ADDING YOUR OWN CUSTOM IP TO ROCKET CHIP
+        (Mapped Directly from `quasiSoC`'s `custom_ip.v` + Rocket Extensions)
+================================================================================
+
+3.1 How Custom IP Attachment Differs from `quasiSoC`
+----------------------------------------------------
+In `F:\Anamoly_detection\quasiSoC`, adding `custom_ip.v` (`0x9500_0000`) required
+manually modifying 4 separate files:
+  1. `lowmapper.v`      (hardcode `aid1=9, aid2=5` address decode & byte-lane swap)
+  2. `interrupt_unit.v` (widen IRQ mask register & hardcode `dev_id = 5`)
+  3. `quasi_main.v`     (wire clock, reset, bus strobes, and IRQ wire at top)
+  4. `run_sim.sh`       (append `custom_ip.v` to Verilator command line)
+
+In Rocket Chip, you NEVER manually edit bus decoders or PLIC port widths. Instead,
+Rocket Chip provides THREE clean architectural extension points depending on what
+your IP needs:
+
+  +------------------------+------------------+------------------+-------------------+
+  | Extension Pattern      | Bus / Interface  | Best Use Case    | Software Access   |
+  +------------------------+------------------+------------------+-------------------+
+  | Pattern A:             | `PBUS` or `CBUS` | Control/status   | MMIO pointers /   |
+  | `TLRegisterRouter` +   | (TileLink) +     | accelerators,    | Linux UIO or      |
+  | `HasInterruptSources`  | `ibus` (PLIC)    | timers, sensors  | platform driver   |
+  +------------------------+------------------+------------------+-------------------+
+  | Pattern B:             | Chisel `BlackBox`| Reusing existing | Same as Pattern A |
+  | Verilog `BlackBox`     | inside Pattern A | `.v` / `.sv` RTL | (MMIO + PLIC IRQ) |
+  | (`HasBlackBoxResource`)| or `AXI4Slave`   | (`custom_ip.v`!) |                   |
+  +------------------------+------------------+------------------+-------------------+
+  | Pattern C:             | Inside `Rocket`  | Low-latency ML / | Custom RISC-V     |
+  | `LazyRoCC` Coprocessor | Tile (`custom0-3`| crypto / anomaly | instructions      |
+  | + `coreMonitorBundle`  | + L1 D$ + Trace) | detection engines| (`.insn r ...`)   |
+  +------------------------+------------------+------------------+-------------------+
+
+--------------------------------------------------------------------------------
+3.2 PATTERN A (Recommended): Native Chisel TileLink MMIO + PLIC Interrupt IP
+    (1-to-1 Equivalent of `quasiSoC`'s `custom_ip.v`!)
+--------------------------------------------------------------------------------
+Let's port `quasiSoC`'s exact `custom_ip` specification to Rocket Chip at base
+address `0x1002_0000` on `PBUS` (any unused address outside existing slaves works;
+Diplomacy verifies there are no overlaps at compile time!):
+  - `+0x00 CTRL`       : bit 0 `start` (pulse), bit 1 `irq_en` (R/W), bit 2 `busy` (RO)
+  - `+0x04 DATA_IN`    : 32-bit R/W input operand
+  - `+0x08 RESULT`     : 32-bit RO result `(DATA_IN ^ 0xA5A55A5A) + 1` after 16 cycles
+  - `+0x0C IRQ_STATUS` : bit 0 `done_pending` (W1C), bits `[15:8]` `irq_count` (RO)
+  - `interrupts(0)`    : Level-high interrupt (`done_pending && irq_en`) routed
+                         into Rocket's standard RISC-V **PLIC** (`0x0C00_0000`)!
+                         *(Note: Standard RISC-V PLIC gateways expect a level-sensitive
+                         pending signal `done_pending && irq_en` cleared by W1C in the
+                         ISR, rather than a 1-cycle pulse that could be missed before
+                         PLIC claim!)*
+
+Step A1: Create `src/main/scala/devices/tilelink/CustomAnomalyIP.scala`
+-----------------------------------------------------------------------
+    package freechips.rocketchip.devices.tilelink
+
+    import chisel3._
+    import chisel3.util._
+    import org.chipsalliance.cde.config.{Field, Parameters, Config}
+    import org.chipsalliance.diplomacy.lazymodule._
+    import freechips.rocketchip.interrupts.HasInterruptSources
+    import freechips.rocketchip.regmapper.{RegField, RegFieldDesc, RegisterRouter, RegisterRouterParams}
+    import freechips.rocketchip.subsystem.{BaseSubsystem, PBUS}
+    import freechips.rocketchip.tilelink.{HasTLControlRegMap, TLFragmenter}
+
+    case class CustomAnomalyIPParams(
+      address: BigInt = 0x10020000L,
+      beatBytes: Int = 4
+    )
+
+    case object CustomAnomalyIPKey extends Field[Option[CustomAnomalyIPParams]](None)
+
+    class TLCustomAnomalyIP(params: CustomAnomalyIPParams)(implicit p: Parameters)
+      extends RegisterRouter(
+        RegisterRouterParams(
+          name      = "custom-anomaly-ip",
+          compat    = Seq("custom,anomaly-ip0"),
+          base      = params.address,
+          size      = 0x1000,
+          beatBytes = params.beatBytes))
+      with HasTLControlRegMap
+      with HasInterruptSources
+    {
+      def nInterrupts = 1
+
+      lazy val module = new Impl
+      class Impl extends LazyModuleImp(this) {
+        val irqEn       = RegInit(false.B)
+        val busy        = RegInit(false.B)
+        val computeCnt  = RegInit(0.U(5.W))
+        val regDataIn   = RegInit(0.U(32.W))
+        val regResult   = RegInit(0.U(32.W))
+        val donePending = RegInit(false.B)
+        val irqCount    = RegInit(0.U(8.W))
+
+        // Drive PLIC interrupt line (level-sensitive until software W1C clears donePending)
+        interrupts(0) := donePending && irqEn
+
+        // 16-cycle hardware compute state machine
+        when (busy) {
+          when (computeCnt === 1.U) {
+            busy        := false.B
+            computeCnt  := 0.U
+            regResult   := (regDataIn ^ "hA5A55A5A".U(32.W)) + 1.U
+            donePending := true.B
+            when (irqEn) { irqCount := irqCount + 1.U }
+          } .otherwise {
+            computeCnt := computeCnt - 1.U
+          }
+        }
+
+        // Write-1-to-start pulse helper on bit 0 of CTRL
+        val startWrite = WireInit(false.B)
+        when (startWrite && !busy) {
+          busy       := true.B
+          computeCnt := 16.U
+        }
+
+        regmap(
+          0x00 -> Seq(
+            RegField(1, () => false.B, (_, valid, bits) => { when(valid && bits(0)) { startWrite := true.B }; true.B },
+              RegFieldDesc("start", "Write 1 to start 16-cycle compute")),
+            RegField(1, irqEn, RegFieldDesc("irq_en", "Interrupt enable")),
+            RegField.r(1, busy, RegFieldDesc("busy", "Compute busy flag"))
+          ),
+          0x04 -> Seq(
+            RegField(32, regDataIn, RegFieldDesc("data_in", "32-bit input operand"))
+          ),
+          0x08 -> Seq(
+            RegField.r(32, regResult, RegFieldDesc("result", "32-bit computed output"))
+          ),
+          0x0C -> Seq(
+            RegField.w1ToClear(1, donePending, false.B, Some(RegFieldDesc("done_pending", "W1C done status"))),
+            RegField(7), // reserved padding bits [7:1]
+            RegField.r(8, irqCount, RegFieldDesc("irq_count", "Completed IRQ counter"))
+          )
+        )
+      }
+    }
+
+    /** Subsystem trait that attaches TLCustomAnomalyIP onto PBUS + PLIC */
+    trait CanHavePeripheryCustomAnomalyIP { this: BaseSubsystem =>
+      val customAnomalyIP = p(CustomAnomalyIPKey).map { params =>
+        val pbus = locateTLBusWrapper(PBUS)
+        val dev  = pbus { LazyModule(new TLCustomAnomalyIP(params)) }
+        pbus.coupleTo("custom_anomaly_ip") {
+          dev.controlXing(NoCrossing) := TLFragmenter(params.beatBytes, pbus.blockBytes) := _
+        }
+        ibus.fromSync := dev.intXing(NoCrossing)
+        dev
+      }
+    }
+
+    /** Config fragment to enable the IP */
+    class WithCustomAnomalyIP(address: BigInt = 0x10020000L) extends Config((site, here, up) => {
+      case CustomAnomalyIPKey => Some(CustomAnomalyIPParams(address = address))
+    })
+
+Step A2: Mix the Trait into `ExampleRocketSystem` & Add a `Config`
+------------------------------------------------------------------
+  1. In `src/main/scala/system/ExampleRocketSystem.scala`, add:
+       `with CanHavePeripheryCustomAnomalyIP`
+     to `class ExampleRocketSystem`.
+  2. In `src/main/scala/system/Configs.scala`, define your SoC config:
+       `class AnomalySoCConfig extends Config(new WithCustomAnomalyIP(0x10020000L) ++ new DefaultConfig)`
+  3. In `build.sc`, add `("freechips.rocketchip.system.TestHarness", "freechips.rocketchip.system.AnomalySoCConfig")`
+     to `object emulator extends Cross[Emulator](...)`.
+  4. Build Verilog & Verilator simulator:
+       `make emulator CONFIG=freechips.rocketchip.system.AnomalySoCConfig`
+
+What Diplomacy Automatically Generates for You:
+  - Adds a 32-bit TileLink port on `PBUS` decoded at `0x1002_0000 - 0x1002_0FFF`
+  - Increments PLIC `riscv,ndev` and wires your IRQ into the PLIC (`interrupts = <3>`)
+  - Emits this node automatically into `AnomalySoCConfig.dts`:
+        custom-anomaly-ip@10020000 {
+            compatible = "custom,anomaly-ip0";
+            interrupt-parent = <&L7>;
+            interrupts = <3>;
+            reg = <0x10020000 0x1000>;
+        };
+
+Step A3: Accessing Your Custom IP from Bare-Metal C & Linux
+-----------------------------------------------------------
+  * Bare-Metal C Test (like `quasiSoC/software/custom_ip_test/main.c`):
+    - Registers work identically (`*(volatile uint32_t *)0x10020000`, etc.)!
+    - Instead of `INT_UNIT_MASK = 0x0E` at `0x9800_0000`, configure Rocket's
+      standard RISC-V **PLIC (`0x0C00_0000`)** for IRQ ID `N` (shown in `.dts`,
+      typically `3` since `NExtTopInterrupts = 2` occupies IDs `1..2`):
+        1. Set priority > 0 : `*(volatile uint32_t *)(0x0C000000 + 4 * IRQ_ID) = 1;`
+        2. Enable on Hart 0 M-mode : `*(volatile uint32_t *)(0x0C002000) |= (1u << IRQ_ID);`
+        3. Set threshold = 0 : `*(volatile uint32_t *)(0x0C200000) = 0;`
+        4. In `m_trap_handler` (`mcause == 0x800000000000000B` on RV64!):
+           - Claim IRQ  : `uint32_t id = *(volatile uint32_t *)0x0C200004;`
+           - Read `RESULT` & write `1` to `IRQ_STATUS` (`0x1002000C`) to clear W1C
+           - Complete IRQ: `*(volatile uint32_t *)0x0C200004 = id;`
+
+  * Inside Linux (Zero Custom Kernel Code Needed via UIO, or Platform Driver):
+    - Enable `CONFIG_UIO=y` and `CONFIG_UIO_PDRV_GENIRQ=y` in Linux and boot with
+      `uio_pdrv_genirq.of_id=custom,anomaly-ip0` in `bootargs`!
+    - Linux automatically binds your `.dts` node to `/dev/uio0`:
+      * `mmap("/dev/uio0", ...)` maps `0x1002_0000` directly into Linux user-space!
+      * `read(uio_fd, &irq_count, 4)` sleeps until your hardware raises the PLIC IRQ!
+
+--------------------------------------------------------------------------------
+3.3 PATTERN B: Reusing Existing Verilog RTL (`custom_ip.v`) via Chisel `BlackBox`
+--------------------------------------------------------------------------------
+If you already have verified Verilog/SystemVerilog RTL (such as `custom_ip.v`
+from `quasiSoC` or a generated HLS/RTL anomaly engine):
+  1. Copy `custom_ip.v` into `src/main/resources/vsrc/custom_ip.v`.
+     *(Note: In `custom_ip.v` lines 19-21, remove the big-endian byte swap used
+     by QuasiSoC's bus, because Rocket Chip's TileLink/AXI4 buses are standard
+     little-endian RISC-V!)*
+  2. Declare a Chisel `BlackBox` in Scala:
+        class custom_ip extends BlackBox with HasBlackBoxResource {
+          val io = IO(new Bundle {
+            val clk = Input(Clock())
+            val rst = Input(Bool())
+            val a   = Input(UInt(4.W))
+            val d   = Input(UInt(32.W))
+            val we  = Input(Bool())
+            val spo = Output(UInt(32.W))
+            val irq = Output(Bool())
+          })
+          addResource("/vsrc/custom_ip.v")
+        }
+  3. Instantiate `Module(new custom_ip)` inside `TLCustomAnomalyIP`'s `Impl` (or
+     attach an `AXI4SlaveNode` on `PBUS`), connecting `clock` -> `io.clk`,
+     `reset.asBool` -> `io.rst`, and latching `io.irq` into PLIC `interrupts(0)`.
+     Mill's `mfccompiler` + `verilator` flow automatically compiles `/vsrc/custom_ip.v`!
+
+--------------------------------------------------------------------------------
+3.4 PATTERN C: Tightly-Coupled Anomaly Detection & Coprocessors (Rocket-Specific!)
+--------------------------------------------------------------------------------
+Because your workspace (`F:\Anamoly_detection`) targets anomaly detection, Rocket
+Chip offers two capabilities that `quasiSoC` did not have at all:
+
+  1. Hardware Execution Trace Tap (`coreMonitorBundle` / `TraceCoreInterface`):
+     - Every `Rocket` core already exposes `coreMonitorBundle` (see
+       `RocketSubsystem.scala` lines 31-33) and optional RISC-V E-Trace ingress
+       (`enableTraceCoreIngress = true` in `RocketCoreParams`, see `RocketCore.scala`
+       lines 61 & 153).
+     - These signals output cycle-by-cycle retired instruction metadata directly
+       from the `WB` stage: `valid`, `pc`, `inst`, `priv_mode`, `wrdst`, `wdata`,
+       `xcpt`/`interrupt` traps, and `time`.
+     - You can feed `coreMonitorBundles.head` directly into your custom hardware
+       anomaly detector (shadow call stack, control-flow integrity checker,
+       performance counter anomaly ML detector, etc.) and trigger a PLIC/NMI
+       interrupt the instant an anomalous execution pattern occurs!
+
+  2. Custom Instruction Accelerator (`LazyRoCC` — `src/main/scala/tile/LazyRoCC.scala`):
+     - See `RoccExampleConfig` (`AccumulatorExample`, `TranslatorExample`,
+       `CharacterCountExample`, `BlackBoxExample` in `LazyRoCC.scala`).
+     - Attaches via `BuildRoCC` directly inside `RocketTile`:
+       * Executes custom RISC-V instructions (`custom0`..`custom3` opcodes)
+       * Reads two 64-bit CPU registers (`rs1`, `rs2`) and writes back `rd`
+       * Has its own coherent port into the L1 `HellaCache` (`io.mem`) and virtual
+         address translation port into the `PTW` (`io.ptw`)!
+
+================================================================================
+SUMMARY ROADMAP RECOMMENDED FOR YOUR PROJECT
+================================================================================
+  Phase 1: Test `DefaultConfig` Linux boot in `spike` (2s) -> Verilator (`emulator`)
+           using OpenSBI `fw_payload.elf` + HTIF (`earlycon=sbi console=hvc0 lpj=10000`).
+  Phase 2: Add `TLCustomAnomalyIP` (`Pattern A` or `Pattern B` wrapping your Verilog)
+           at `0x1002_0000` on `PBUS` + PLIC IRQ, and verify it first with a fast
+           5-second bare-metal C test on `emulator` (just like `custom_ip_test`).
+  Phase 3: Boot Linux on `AnomalySoCConfig` with `uio_pdrv_genirq.of_id=custom,anomaly-ip0`
+           to exercise your custom IP + interrupts from a Linux user-space C program,
+           and optionally wire `coreMonitorBundle` / `LazyRoCC` (`Pattern C`) for
+           cycle-accurate hardware anomaly monitoring!
+================================================================================
